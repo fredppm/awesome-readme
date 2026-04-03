@@ -7,12 +7,13 @@ Usage:
     python github_loc_report.py <org> [options]
 
 Options:
-    --token TOKEN       GitHub personal access token (or set GITHUB_TOKEN env var)
-    --since YYYY-MM-DD  Only include commits after this date
-    --until YYYY-MM-DD  Only include commits before this date
-    --output FILE       Output CSV file (default: loc_report.csv)
-    --repos REPO,...    Comma-separated list of repos to include (default: all)
-    --workers N         Number of parallel workers (default: 5)
+    --token TOKEN        GitHub personal access token (or set GITHUB_TOKEN env var)
+    --since YYYY-MM-DD   Only include commits after this date
+    --until YYYY-MM-DD   Only include commits before this date
+    --last-months N      Shortcut: last N months from today (default: 12, used when --since is omitted)
+    --output FILE        Output CSV file (default: loc_report.csv)
+    --repos REPO,...     Comma-separated list of repos to include (default: all)
+    --workers N          Number of parallel workers (default: 5)
 """
 
 import argparse
@@ -21,7 +22,7 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 
@@ -142,6 +143,8 @@ def main():
     parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"), help="GitHub token")
     parser.add_argument("--since", help="Start date YYYY-MM-DD (inclusive)")
     parser.add_argument("--until", help="End date YYYY-MM-DD (inclusive)")
+    parser.add_argument("--last-months", type=int, default=12, metavar="N",
+                        help="Last N months from today (default: 12, ignored if --since is set)")
     parser.add_argument("--output", default="loc_report.csv", help="Output CSV file")
     parser.add_argument("--repos", help="Comma-separated list of specific repos")
     parser.add_argument("--workers", type=int, default=5, help="Parallel workers")
@@ -151,9 +154,27 @@ def main():
         print("Error: GitHub token required. Use --token or set GITHUB_TOKEN env var.")
         sys.exit(1)
 
-    # Convert dates to ISO 8601 with time component expected by GitHub API
-    since = f"{args.since}T00:00:00Z" if args.since else None
-    until = f"{args.until}T23:59:59Z" if args.until else None
+    # Resolve date range
+    today = datetime.now(timezone.utc)
+    if args.since:
+        since_dt = datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc)
+    else:
+        # subtract N months manually (stdlib only)
+        month = today.month - args.last_months
+        year = today.year + month // 12
+        month = month % 12 or 12
+        since_dt = today.replace(year=year, month=month, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    until_dt = (
+        datetime.fromisoformat(args.until).replace(tzinfo=timezone.utc)
+        if args.until
+        else today
+    )
+
+    since = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    until = until_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    print(f"Date range: {since[:10]} → {until[:10]}")
 
     client = GitHubClient(args.token)
 
