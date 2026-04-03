@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
 GitHub LOC Report
-Generates a CSV report of lines of code committed per user/repo/date for a GitHub org.
+Gera relatório de linhas de código por usuário/repo para uma org do GitHub.
+
+Usa o endpoint stats/contributors: 1 request por repo (muito mais rápido que
+buscar commit a commit). Cobre até 52 semanas (~12 meses).
 
 Usage:
     python github_loc_report.py <org> [options]
 
 Options:
-    --token TOKEN        GitHub personal access token (or set GITHUB_TOKEN env var)
-    --since YYYY-MM-DD   Only include commits after this date
-    --until YYYY-MM-DD   Only include commits before this date
-    --last-months N      Shortcut: last N months from today (default: 12, used when --since is omitted)
-    --output FILE        Output CSV file (default: loc_report.csv)
-    --repos REPO,...     Comma-separated list of repos to include (default: all)
-    --workers N          Number of parallel workers (default: 5)
+    --token TOKEN        GitHub token (ou env GITHUB_TOKEN)
+    --last-months N      Últimos N meses a partir de hoje (default: 12, máx: 12)
+    --since YYYY-MM-DD   Data de início (substitui --last-months)
+    --until YYYY-MM-DD   Data de fim (default: hoje)
+    --repos REPO,...     Repos específicos (default: todos da org)
+    --workers N          Workers paralelos (default: 8)
+    --output FILE        Arquivo CSV de saída (default: loc_report.csv)
+    --no-csv             Não gera CSV, só exibe o resumo no terminal
 """
 
 import argparse
@@ -22,12 +26,14 @@ import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import requests
 
 BASE_URL = "https://api.github.com"
 
+
+# ─── GitHub client ────────────────────────────────────────────────────────────
 
 class GitHubClient:
     def __init__(self, token: str):
@@ -38,33 +44,38 @@ class GitHubClient:
             "X-GitHub-Api-Version": "2022-11-28",
         })
 
-    def _get(self, url: str, params: dict = None) -> dict | list:
-        for attempt in range(5):
+    def get(self, url: str, params: dict = None, retries: int = 6) -> list | dict | None:
+        for attempt in range(retries):
             resp = self.session.get(url, params=params, timeout=30)
 
-            if resp.status_code == 403 and "rate limit" in resp.text.lower():
-                reset_at = int(resp.headers.get("X-RateLimit-Reset", time.time() + 60))
-                wait = max(reset_at - time.time(), 1)
-                print(f"  [rate limit] waiting {wait:.0f}s...", flush=True)
+            if resp.status_code == 202:
+                # GitHub está computando as stats — aguarda e tenta de novo
+                wait = 2 ** attempt
                 time.sleep(wait)
                 continue
 
-            if resp.status_code == 409:  # empty repo
-                return []
+            if resp.status_code == 204 or resp.status_code == 409:
+                return []  # repo vazio ou sem conteúdo
+
+            if resp.status_code in (403, 429):
+                reset_at = int(resp.headers.get("X-RateLimit-Reset", time.time() + 60))
+                wait = max(reset_at - time.time(), 1)
+                print(f"  [rate limit] aguardando {wait:.0f}s...", flush=True)
+                time.sleep(wait)
+                continue
 
             resp.raise_for_status()
             return resp.json()
 
-        raise RuntimeError(f"Failed after retries: {url}")
+        return None  # esgotou retries (normalmente 202 repetido = repo sem stats)
 
     def paginate(self, url: str, params: dict = None) -> list:
         params = dict(params or {})
         params.setdefault("per_page", 100)
-        results = []
-        page = 1
+        results, page = [], 1
         while True:
             params["page"] = page
-            data = self._get(url, params)
+            data = self.get(url, params)
             if not data:
                 break
             results.extend(data)
@@ -74,94 +85,129 @@ class GitHubClient:
         return results
 
     def get_org_repos(self, org: str) -> list[dict]:
-        print(f"Fetching repos for org: {org}", flush=True)
         return self.paginate(f"{BASE_URL}/orgs/{org}/repos", {"type": "all"})
 
-    def get_commits(self, org: str, repo: str, since: str = None, until: str = None) -> list[dict]:
-        params = {}
-        if since:
-            params["since"] = since
-        if until:
-            params["until"] = until
-        return self.paginate(f"{BASE_URL}/repos/{org}/{repo}/commits", params)
-
-    def get_commit_detail(self, org: str, repo: str, sha: str) -> dict:
-        return self._get(f"{BASE_URL}/repos/{org}/{repo}/commits/{sha}")
+    def get_contributor_stats(self, org: str, repo: str) -> list[dict]:
+        """
+        Retorna lista de contribuidores com breakdown semanal de additions/deletions/commits.
+        Endpoint: GET /repos/{owner}/{repo}/stats/contributors
+        Resposta pode ser 202 enquanto o GitHub computa — o client já trata isso.
+        """
+        return self.get(f"{BASE_URL}/repos/{org}/{repo}/stats/contributors") or []
 
 
-def process_repo(client: GitHubClient, org: str, repo_name: str, since: str, until: str) -> list[dict]:
-    print(f"  [{repo_name}] fetching commits...", flush=True)
-    try:
-        commits = client.get_commits(org, repo_name, since, until)
-    except requests.HTTPError as e:
-        print(f"  [{repo_name}] skipped ({e})", flush=True)
-        return []
+# ─── Processamento ────────────────────────────────────────────────────────────
 
-    if not commits:
+def process_repo(
+    client: GitHubClient,
+    org: str,
+    repo_name: str,
+    since_ts: int,
+    until_ts: int,
+) -> list[dict]:
+    stats = client.get_contributor_stats(org, repo_name)
+    if not stats:
         return []
 
     rows = []
-    for i, commit in enumerate(commits):
-        sha = commit["sha"]
-        author = (
-            commit.get("author") or {}
-        ).get("login") or (
-            commit.get("commit", {}).get("author") or {}
-        ).get("name", "unknown")
-        date_raw = commit.get("commit", {}).get("author", {}).get("date", "")
-        date = date_raw[:10] if date_raw else ""
+    for contributor in stats:
+        user = (contributor.get("author") or {}).get("login", "unknown")
+        for week in contributor.get("weeks", []):
+            week_ts = week["w"]  # Unix timestamp (início da semana, domingo)
+            if week_ts < since_ts or week_ts > until_ts:
+                continue
+            added = week.get("a", 0)
+            deleted = week.get("d", 0)
+            commits = week.get("c", 0)
+            if added == 0 and deleted == 0 and commits == 0:
+                continue
+            week_date = datetime.fromtimestamp(week_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+            rows.append({
+                "repo": repo_name,
+                "week": week_date,
+                "user": user,
+                "commits": commits,
+                "loc_added": added,
+                "loc_deleted": deleted,
+                "loc_net": added - deleted,
+            })
 
-        try:
-            detail = client.get_commit_detail(org, repo_name, sha)
-            stats = detail.get("stats", {})
-            additions = stats.get("additions", 0)
-            deletions = stats.get("deletions", 0)
-        except Exception as e:
-            print(f"  [{repo_name}] commit {sha[:7]} error: {e}", flush=True)
-            additions, deletions = 0, 0
-
-        rows.append({
-            "repo": repo_name,
-            "date": date,
-            "user": author,
-            "sha": sha[:7],
-            "loc_added": additions,
-            "loc_deleted": deletions,
-            "loc_net": additions - deletions,
-        })
-
-        if (i + 1) % 20 == 0:
-            print(f"  [{repo_name}] {i + 1}/{len(commits)} commits processed", flush=True)
-
-    print(f"  [{repo_name}] done — {len(rows)} commits", flush=True)
     return rows
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Generate a GitHub LOC report for an org.")
-    parser.add_argument("org", help="GitHub organization name")
-    parser.add_argument("--token", default=os.environ.get("GITHUB_TOKEN"), help="GitHub token")
-    parser.add_argument("--since", help="Start date YYYY-MM-DD (inclusive)")
-    parser.add_argument("--until", help="End date YYYY-MM-DD (inclusive)")
-    parser.add_argument("--last-months", type=int, default=12, metavar="N",
-                        help="Last N months from today (default: 12, ignored if --since is set)")
-    parser.add_argument("--output", default="loc_report.csv", help="Output CSV file")
-    parser.add_argument("--repos", help="Comma-separated list of specific repos")
-    parser.add_argument("--workers", type=int, default=5, help="Parallel workers")
-    args = parser.parse_args()
+# ─── Apresentação ─────────────────────────────────────────────────────────────
 
-    if not args.token:
-        print("Error: GitHub token required. Use --token or set GITHUB_TOKEN env var.")
-        sys.exit(1)
+def print_summary(all_rows: list[dict], since_dt: datetime, until_dt: datetime):
+    """Exibe tabelas de resumo no terminal."""
 
-    # Resolve date range
-    today = datetime.now(timezone.utc)
+    total_commits = sum(r["commits"] for r in all_rows)
+    total_added   = sum(r["loc_added"] for r in all_rows)
+    total_deleted = sum(r["loc_deleted"] for r in all_rows)
+
+    # Agrega por usuário
+    by_user: dict[str, dict] = {}
+    for r in all_rows:
+        u = r["user"]
+        if u not in by_user:
+            by_user[u] = {"commits": 0, "loc_added": 0, "loc_deleted": 0, "loc_net": 0, "repos": set()}
+        by_user[u]["commits"]     += r["commits"]
+        by_user[u]["loc_added"]   += r["loc_added"]
+        by_user[u]["loc_deleted"] += r["loc_deleted"]
+        by_user[u]["loc_net"]     += r["loc_net"]
+        by_user[u]["repos"].add(r["repo"])
+
+    # Agrega por repo
+    by_repo: dict[str, dict] = {}
+    for r in all_rows:
+        rp = r["repo"]
+        if rp not in by_repo:
+            by_repo[rp] = {"commits": 0, "loc_added": 0, "loc_deleted": 0, "loc_net": 0}
+        by_repo[rp]["commits"]     += r["commits"]
+        by_repo[rp]["loc_added"]   += r["loc_added"]
+        by_repo[rp]["loc_deleted"] += r["loc_deleted"]
+        by_repo[rp]["loc_net"]     += r["loc_net"]
+
+    W = 80
+    print("\n" + "═" * W)
+    print(f"  GitHub LOC Report")
+    print(f"  Período : {since_dt.strftime('%Y-%m-%d')} → {until_dt.strftime('%Y-%m-%d')}")
+    print(f"  Repos   : {len(by_repo)}   |   Usuários: {len(by_user)}   |   Commits: {total_commits}")
+    print(f"  LOC +{total_added:,}  -{total_deleted:,}  net {total_added - total_deleted:+,}")
+    print("═" * W)
+
+    # Tabela por usuário
+    print(f"\n{'USUÁRIO':<28} {'REPOS':>5} {'COMMITS':>8} {'ADDED':>10} {'DELETED':>10} {'NET':>10}")
+    print("─" * W)
+    for user, s in sorted(by_user.items(), key=lambda x: x[1]["loc_added"], reverse=True):
+        print(
+            f"{user:<28} {len(s['repos']):>5} {s['commits']:>8,} "
+            f"{s['loc_added']:>10,} {s['loc_deleted']:>10,} {s['loc_net']:>+10,}"
+        )
+
+    # Tabela por repo
+    print(f"\n{'REPO':<35} {'COMMITS':>8} {'ADDED':>10} {'DELETED':>10} {'NET':>10}")
+    print("─" * W)
+    for repo, s in sorted(by_repo.items(), key=lambda x: x[1]["loc_added"], reverse=True):
+        name = repo if len(repo) <= 35 else repo[:32] + "..."
+        print(
+            f"{name:<35} {s['commits']:>8,} "
+            f"{s['loc_added']:>10,} {s['loc_deleted']:>10,} {s['loc_net']:>+10,}"
+        )
+
+    print("═" * W + "\n")
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def resolve_dates(args) -> tuple[datetime, datetime]:
+    today = datetime.now(timezone.utc).replace(hour=23, minute=59, second=59, microsecond=0)
+
     if args.since:
         since_dt = datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc)
     else:
-        # subtract N months manually (stdlib only)
-        month = today.month - args.last_months
-        year = today.year + month // 12
+        n = min(args.last_months, 12)  # stats/contributors cobre no máx 52 semanas
+        month = today.month - n
+        year  = today.year + month // 12
         month = month % 12 or 12
         since_dt = today.replace(year=year, month=month, day=1, hour=0, minute=0, second=0, microsecond=0)
 
@@ -170,64 +216,79 @@ def main():
         if args.until
         else today
     )
+    return since_dt, until_dt
 
-    since = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    until = until_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    print(f"Date range: {since[:10]} → {until[:10]}")
+def main():
+    parser = argparse.ArgumentParser(
+        description="Relatório de LOC por usuário/repo para uma org do GitHub.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("org",           help="Nome da organização no GitHub")
+    parser.add_argument("--token",       default=os.environ.get("GITHUB_TOKEN"), help="GitHub token")
+    parser.add_argument("--last-months", type=int, default=12, metavar="N",
+                        help="Últimos N meses (default: 12, máx: 12)")
+    parser.add_argument("--since",       help="Data início YYYY-MM-DD")
+    parser.add_argument("--until",       help="Data fim YYYY-MM-DD")
+    parser.add_argument("--repos",       help="Repos específicos separados por vírgula")
+    parser.add_argument("--workers",     type=int, default=8, help="Workers paralelos (default: 8)")
+    parser.add_argument("--output",      default="loc_report.csv", help="Arquivo CSV de saída")
+    parser.add_argument("--no-csv",      action="store_true", help="Não gera arquivo CSV")
+    args = parser.parse_args()
+
+    if not args.token:
+        print("Erro: token GitHub necessário. Use --token ou defina GITHUB_TOKEN.")
+        sys.exit(1)
+
+    since_dt, until_dt = resolve_dates(args)
+    since_ts = int(since_dt.timestamp())
+    until_ts = int(until_dt.timestamp())
 
     client = GitHubClient(args.token)
 
     if args.repos:
         repos = [{"name": r.strip()} for r in args.repos.split(",")]
     else:
+        print(f"Buscando repos de: {args.org}", flush=True)
         repos = client.get_org_repos(args.org)
 
-    print(f"Found {len(repos)} repos. Starting commit extraction with {args.workers} workers...\n", flush=True)
+    print(f"{len(repos)} repos encontrados. Extraindo stats ({args.workers} workers)...", flush=True)
 
-    all_rows = []
+    all_rows: list[dict] = []
 
     with ThreadPoolExecutor(max_workers=args.workers) as executor:
         futures = {
-            executor.submit(process_repo, client, args.org, repo["name"], since, until): repo["name"]
-            for repo in repos
+            executor.submit(process_repo, client, args.org, r["name"], since_ts, until_ts): r["name"]
+            for r in repos
         }
+        done = 0
         for future in as_completed(futures):
+            done += 1
             repo_name = futures[future]
             try:
                 rows = future.result()
                 all_rows.extend(rows)
+                if rows:
+                    print(f"  [{done}/{len(repos)}] {repo_name}: {len(rows)} semanas com atividade", flush=True)
+                else:
+                    print(f"  [{done}/{len(repos)}] {repo_name}: sem atividade no período", flush=True)
             except Exception as e:
-                print(f"  [{repo_name}] unexpected error: {e}", flush=True)
+                print(f"  [{done}/{len(repos)}] {repo_name}: erro — {e}", flush=True)
 
-    # Sort by date desc, then repo, then user
-    all_rows.sort(key=lambda r: (r["date"], r["repo"], r["user"]), reverse=True)
+    if not all_rows:
+        print("Nenhum dado encontrado para o período.")
+        sys.exit(0)
 
-    fieldnames = ["repo", "date", "user", "sha", "loc_added", "loc_deleted", "loc_net"]
-    with open(args.output, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(all_rows)
+    print_summary(all_rows, since_dt, until_dt)
 
-    print(f"\nReport written to: {args.output}")
-    print(f"Total commits: {len(all_rows)}")
-
-    # Summary by user
-    summary: dict[str, dict] = {}
-    for row in all_rows:
-        u = row["user"]
-        if u not in summary:
-            summary[u] = {"commits": 0, "loc_added": 0, "loc_deleted": 0, "loc_net": 0}
-        summary[u]["commits"] += 1
-        summary[u]["loc_added"] += row["loc_added"]
-        summary[u]["loc_deleted"] += row["loc_deleted"]
-        summary[u]["loc_net"] += row["loc_net"]
-
-    print("\n--- Summary by user ---")
-    print(f"{'user':<30} {'commits':>8} {'added':>10} {'deleted':>10} {'net':>10}")
-    print("-" * 70)
-    for user, s in sorted(summary.items(), key=lambda x: x[1]["loc_net"], reverse=True):
-        print(f"{user:<30} {s['commits']:>8} {s['loc_added']:>10} {s['loc_deleted']:>10} {s['loc_net']:>10}")
+    if not args.no_csv:
+        all_rows.sort(key=lambda r: (r["week"], r["repo"], r["user"]), reverse=True)
+        fieldnames = ["repo", "week", "user", "commits", "loc_added", "loc_deleted", "loc_net"]
+        with open(args.output, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(all_rows)
+        print(f"CSV salvo em: {args.output}")
 
 
 if __name__ == "__main__":
