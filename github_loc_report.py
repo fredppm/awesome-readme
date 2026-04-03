@@ -194,6 +194,25 @@ def print_summary(all_rows: list[dict], since_dt: datetime, until_dt: datetime):
             f"{s['loc_added']:>10,} {s['loc_deleted']:>10,} {s['loc_net']:>+10,}"
         )
 
+    # Tabela por semana (mais recente → mais antiga)
+    by_week: dict[str, dict] = {}
+    for r in all_rows:
+        w = r["week"]
+        if w not in by_week:
+            by_week[w] = {"commits": 0, "loc_added": 0, "loc_deleted": 0, "loc_net": 0}
+        by_week[w]["commits"]     += r["commits"]
+        by_week[w]["loc_added"]   += r["loc_added"]
+        by_week[w]["loc_deleted"] += r["loc_deleted"]
+        by_week[w]["loc_net"]     += r["loc_net"]
+
+    print(f"\n{'SEMANA':<12} {'COMMITS':>8} {'ADDED':>10} {'DELETED':>10} {'NET':>10}")
+    print("─" * W)
+    for week, s in sorted(by_week.items(), reverse=True):
+        print(
+            f"{week:<12} {s['commits']:>8,} "
+            f"{s['loc_added']:>10,} {s['loc_deleted']:>10,} {s['loc_net']:>+10,}"
+        )
+
     print("═" * W + "\n")
 
 
